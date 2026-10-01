@@ -1,0 +1,149 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    networks:
+      - transactions-store
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on: 
+      - zookeeper
+    networks:
+      - transactions-store
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9095", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - transactions-store
+    restart: on-failure
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: |
+      "
+      echo 'Ожидание готовности Kafka...'
+      while ! kafka-topics --bootstrap-server kafka:9092 --list; do
+        sleep 1
+      done
+
+      echo 'Создание топиков...'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
+
+      echo 'Топики успешно созданы:'
+      kafka-topics --bootstrap-server kafka:9092 --list
+      "
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+    networks:
+      - transactions-store
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "local"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:9092"
+      KAFKA_CLUSTERS_0_ZOOKEEPER: "zookeeper:2181"
+
+  interface:
+    build: ./interface
+    networks:
+      - transactions-store
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully 
+    volumes:
+      - ./clickhouse/results:/app/results
+      - ./clickhouse/queries:/app/queries
+    environment:     
+      CLICKHOUSE_USERNAME: "click"
+      CLICKHOUSE_PASSWORD: "click"
+      CLICKHOUSE_HOST: "clickhouse"
+      CLICKHOUSE_PORT: "8123"
+
+      KAFKA_TRANSACTIONS_TOPIC: "transactions"
+      BOOTSTRAP_SERVERS: "kafka:9092"
+    ports:
+     - "8501:8501"
+  
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.6
+    networks:
+      - transactions-store
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    environment:
+      CLICKHOUSE_USER: "click"
+      CLICKHOUSE_PASSWORD: "click"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+  
+  clickhouse-setup:
+    image: clickhouse/clickhouse-server:24.6
+    depends_on:
+      clickhouse:
+        condition: service_started
+      kafka-setup:
+        condition: service_completed_successfully 
+    networks:
+      - transactions-store
+    volumes:
+      - ./clickhouse/queries/init_db.sql:/init_db.sql:ro
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: |
+      "
+      echo 'Ожидание готовности ClickHouse...'
+      until clickhouse-client --host clickhouse --user click --password click -q 'SELECT 1'; do
+        sleep 2
+      done
+      
+      echo 'Запуск скрипта инициализации...'
+      clickhouse-client --host clickhouse --user click --password click --multiquery < /init_db.sql
+      echo 'Инициализация завершена.'
+      "
+
+volumes:                
+  clickhouse_data:
+  clickhouse_logs:
+  
+networks:
+  transactions-store:
+    name: transactions-store
+    driver: bridge
+    
